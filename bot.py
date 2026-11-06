@@ -212,11 +212,25 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
                 state TEXT NOT NULL DEFAULT 'pending'
                     CHECK (state IN ('pending', 'sending', 'sent', 'failed', 'uncertain')),
                 detail TEXT NOT NULL DEFAULT '',
+                last_state TEXT NOT NULL DEFAULT '',
+                last_detail TEXT NOT NULL DEFAULT '',
                 message_id INTEGER,
                 retry_of INTEGER UNIQUE REFERENCES run_targets(id),
                 UNIQUE (run_id, peer_id)
             );
             CREATE INDEX IF NOT EXISTS targets_by_state ON run_targets(run_id, state, id);
+            CREATE TABLE IF NOT EXISTS recurring_runs (
+                run_id INTEGER PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                cycle INTEGER NOT NULL DEFAULT 1,
+                completed_at REAL NOT NULL DEFAULT 0,
+                uncertain_total INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS group_pacing (
+                account_id INTEGER NOT NULL REFERENCES profiles(account_id),
+                peer_id INTEGER NOT NULL,
+                next_send_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_id, peer_id)
+            );
             CREATE TABLE IF NOT EXISTS group_sets (
                 id INTEGER PRIMARY KEY,
                 account_id INTEGER NOT NULL REFERENCES profiles(account_id),
@@ -230,9 +244,31 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
         for table, column, definition in (
             ("content", "formatting", "TEXT NOT NULL DEFAULT '[]'"),
             ("runs", "stop_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ("run_targets", "last_state", "TEXT NOT NULL DEFAULT ''"),
+            ("run_targets", "last_detail", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                if table == "run_targets" and column == "last_state":
+                    db.execute("UPDATE run_targets SET last_state = state WHERE state IN ('sent', 'failed', 'uncertain')")
+                elif table == "run_targets" and column == "last_detail":
+                    db.execute("UPDATE run_targets SET last_detail = detail WHERE state IN ('sent', 'failed', 'uncertain')")
+        # Учитываем действовавшую до обновления общую задержку для сохранённых групп.
+        pace_now = time.time()
+        db.execute(
+            """INSERT OR IGNORE INTO group_pacing(account_id, peer_id, next_send_at)
+               SELECT s.account_id, s.peer_id, MIN(p.next_send_at, ?) FROM selected_groups AS s
+               JOIN profiles AS p ON p.account_id = s.account_id WHERE p.next_send_at > ?""",
+            (pace_now + MIN_DELAY, pace_now),
+        )
+        db.execute(
+            """INSERT OR IGNORE INTO group_pacing(account_id, peer_id, next_send_at)
+               SELECT r.account_id, t.peer_id, MIN(p.next_send_at, ?) FROM runs AS r
+               JOIN run_targets AS t ON t.run_id = r.id JOIN profiles AS p ON p.account_id = r.account_id
+               WHERE r.state IN ('running', 'interrupted') AND p.next_send_at > ?""",
+            (pace_now + MIN_DELAY, pace_now),
+        )
+        db.commit()
     except BaseException:
         db.close()
         raise
@@ -241,8 +277,9 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
 
 class Store:
     RUN_SELECT = """
-        SELECT r.*, p.kind, p.source_run_id FROM runs AS r
+        SELECT r.*, p.kind, p.source_run_id, c.cycle, c.completed_at, c.uncertain_total FROM runs AS r
         LEFT JOIN run_posts AS p ON p.run_id = r.id
+        LEFT JOIN recurring_runs AS c ON c.run_id = r.id
     """
 
     def __init__(self, db: sqlite3.Connection):
@@ -282,6 +319,29 @@ class Store:
             )
             if rejected_target is not None:
                 # При FloodWait Telegram явно отказал. Группа снова ожидает отправки.
+                self.db.execute(
+                    "UPDATE run_targets SET state = 'pending' WHERE id = ? AND state = 'sending'",
+                    (rejected_target,),
+                )
+
+    def group_deadline(self, account_id: int, peer_id: int) -> float:
+        row = self.db.execute(
+            "SELECT next_send_at FROM group_pacing WHERE account_id = ? AND peer_id = ?",
+            (account_id, peer_id),
+        ).fetchone()
+        return row["next_send_at"] if row else 0.0
+
+    def defer_group(
+        self, account_id: int, peer_id: int, until: float, *, rejected_target: int | None = None,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                """INSERT INTO group_pacing(account_id, peer_id, next_send_at) VALUES (?, ?, ?)
+                   ON CONFLICT(account_id, peer_id) DO UPDATE
+                   SET next_send_at = MAX(group_pacing.next_send_at, excluded.next_send_at)""",
+                (account_id, peer_id, until),
+            )
+            if rejected_target is not None:
                 self.db.execute(
                     "UPDATE run_targets SET state = 'pending' WHERE id = ? AND state = 'sending'",
                     (rejected_target,),
@@ -369,10 +429,24 @@ class Store:
 
     def recover_runs(self) -> None:
         with self.db:
+            # Прерванная при обновлении активная рассылка продолжится уже циклически.
             self.db.execute(
-                """UPDATE run_targets SET state = 'uncertain', detail = ?
+                """INSERT OR IGNORE INTO recurring_runs(run_id, uncertain_total)
+                   SELECT r.id, (SELECT COUNT(*) FROM run_targets WHERE run_id = r.id AND state = 'uncertain')
+                   FROM runs AS r JOIN run_posts AS p ON p.run_id = r.id
+                   WHERE r.state = 'running' AND p.kind = 'bulk'"""
+            )
+            self.db.execute(
+                """UPDATE recurring_runs SET uncertain_total = uncertain_total + (
+                       SELECT COUNT(*) FROM run_targets
+                       WHERE run_id = recurring_runs.run_id AND state = 'sending')
+                   WHERE run_id IN (SELECT id FROM runs WHERE state = 'running')"""
+            )
+            self.db.execute(
+                """UPDATE run_targets SET state = 'uncertain', detail = ?, last_state = 'uncertain',
+                   last_detail = ?
                    WHERE state = 'sending' AND run_id IN (SELECT id FROM runs WHERE state = 'running')""",
-                ("Запрос прервался. Проверь публикацию в группе.",),
+                ("Запрос прервался. Проверь публикацию в группе.",) * 2,
             )
             self.db.execute(
                 """UPDATE runs SET state = CASE WHEN stop_requested = 1 THEN 'stopped' ELSE 'interrupted' END,
@@ -404,6 +478,8 @@ class Store:
                 "INSERT INTO run_posts VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (run_id, kind, source, *content_fields(content)),
             )
+            if kind == "bulk":
+                self.db.execute("INSERT INTO recurring_runs(run_id) VALUES (?)", (run_id,))
             self.db.executemany(
                 """INSERT INTO run_targets(run_id, peer_id, title, username, retry_of)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -458,8 +534,8 @@ class Store:
     def interrupted_run(self, account_id: int) -> sqlite3.Row | None:
         return self.db.execute(
             self.RUN_SELECT + """WHERE r.account_id = ? AND r.state = 'interrupted' AND r.stop_requested = 0
-               AND p.run_id IS NOT NULL AND EXISTS
-                   (SELECT 1 FROM run_targets WHERE run_id = r.id AND state = 'pending')
+               AND p.run_id IS NOT NULL AND (c.run_id IS NOT NULL OR EXISTS
+                   (SELECT 1 FROM run_targets WHERE run_id = r.id AND state = 'pending'))
                ORDER BY r.id DESC LIMIT 1""",
             (account_id,),
         ).fetchone()
@@ -469,7 +545,8 @@ class Store:
             cursor = self.db.execute(
                 """UPDATE runs SET state = 'running', note = '', stop_requested = 0, chat_id = ?
                    WHERE id = ? AND account_id = ? AND state IN ('stopped', 'failed', 'interrupted')
-                   AND EXISTS (SELECT 1 FROM run_targets WHERE run_id = runs.id AND state = 'pending')
+                   AND (EXISTS (SELECT 1 FROM recurring_runs WHERE run_id = runs.id)
+                        OR EXISTS (SELECT 1 FROM run_targets WHERE run_id = runs.id AND state = 'pending'))
                    AND NOT EXISTS (SELECT 1 FROM runs WHERE account_id = ? AND state = 'running')""",
                 (chat_id, run_id, account_id, account_id),
             )
@@ -487,6 +564,13 @@ class Store:
             if not cursor.rowcount:
                 raise RunFailed("Не удалось зафиксировать начало отправки.")
 
+    def retry_target(self, target_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE run_targets SET state = 'pending' WHERE id = ? AND state = 'sending'",
+                (target_id,),
+            )
+
     def target_sending(self, target_id: int) -> bool:
         row = self.db.execute("SELECT state FROM run_targets WHERE id = ?", (target_id,)).fetchone()
         return row is not None and row["state"] == "sending"
@@ -496,22 +580,65 @@ class Store:
     ) -> None:
         with self.db:
             cursor = self.db.execute(
-                """UPDATE run_targets SET state = ?, detail = ?, message_id = ?
+                """UPDATE run_targets SET state = ?, detail = ?, message_id = ?,
+                   last_state = ?, last_detail = ?
                    WHERE run_id = ? AND id = ? AND state IN ('pending', 'sending')""",
-                (state, detail, message_id, run_id, target_id),
+                (state, detail, message_id, state, detail, run_id, target_id),
             )
             if cursor.rowcount:
                 self.db.execute(
                     "UPDATE runs SET sent = sent + ?, errors = errors + ? WHERE id = ?",
                     (int(state == "sent"), int(state == "failed"), run_id),
                 )
+                if state == "uncertain":
+                    self.db.execute(
+                        "UPDATE recurring_runs SET uncertain_total = uncertain_total + 1 WHERE run_id = ?",
+                        (run_id,),
+                    )
+
+    def complete_cycle(self, run_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE recurring_runs SET completed_at = ?
+                   WHERE run_id = ? AND completed_at = 0 AND NOT EXISTS
+                       (SELECT 1 FROM run_targets WHERE run_id = ? AND state IN ('pending', 'sending'))""",
+                (time.time(), run_id, run_id),
+            )
+
+    def advance_cycle(self, run_id: int) -> bool:
+        with self.db:
+            cursor = self.db.execute(
+                """UPDATE recurring_runs SET cycle = cycle + 1, completed_at = 0
+                   WHERE run_id = ? AND completed_at > 0 AND EXISTS
+                       (SELECT 1 FROM runs WHERE id = ? AND state = 'running' AND stop_requested = 0)""",
+                (run_id, run_id),
+            )
+            if not cursor.rowcount:
+                return False
+            self.db.execute(
+                """UPDATE run_targets SET state = 'pending', detail = '', message_id = NULL
+                   WHERE run_id = ?""", (run_id,),
+            )
+            self.db.execute(
+                """UPDATE runs SET total = total +
+                   (SELECT COUNT(*) FROM run_targets WHERE run_id = ?) WHERE id = ?""",
+                (run_id, run_id),
+            )
+            return True
 
     def finish(self, run_id: int, state: str, note: str) -> None:
         with self.db:
             self.db.execute(
-                """UPDATE run_targets SET state = 'uncertain', detail = ?
+                """UPDATE recurring_runs SET uncertain_total = uncertain_total +
+                   (SELECT COUNT(*) FROM run_targets WHERE run_id = ? AND state = 'sending')
+                   WHERE run_id = ?""",
+                (run_id, run_id),
+            )
+            self.db.execute(
+                """UPDATE run_targets SET state = 'uncertain', detail = ?, last_state = 'uncertain',
+                   last_detail = ?
                    WHERE run_id = ? AND state = 'sending'""",
-                ("Запрос прервался. Проверь публикацию в группе.", run_id),
+                ("Запрос прервался. Проверь публикацию в группе.",) * 2 + (run_id,),
             )
             self.db.execute(
                 "UPDATE runs SET state = ?, note = ? WHERE id = ?", (state, note, run_id),
@@ -1004,7 +1131,7 @@ async def show_settings(app: Runtime, chat_id: int, account_id: int) -> None:
     await show(
         app, chat_id,
         f"<b>Интервалы</b>\n"
-        f"Задержка {profile['delay']:g} сек\nОтчёт каждые {profile['report_minutes']} мин",
+        f"Между циклами {profile['delay']:g} сек\nОтчёт каждые {profile['report_minutes']} мин",
         keyboard(
             [button("⏱ Задержка отправки", "pace:send")],
             [button("📊 Интервал отчётов", "pace:report")],
@@ -1036,7 +1163,7 @@ def run_name(run: sqlite3.Row) -> str:
 
 def status_text(app: Runtime, account_id: int, run: sqlite3.Row | None) -> str:
     profile = app.store.profile(account_id)
-    intervals = f"Задержка {profile['delay']:g} сек\nОтчёт каждые {profile['report_minutes']} мин"
+    intervals = f"Между циклами {profile['delay']:g} сек\nОтчёт каждые {profile['report_minutes']} мин"
     if run is None:
         return "<b>Статус рассылки</b>\nРассылок пока нет.\n\n" + intervals
     state = RUN_STATES[run["state"]]
@@ -1047,18 +1174,33 @@ def status_text(app: Runtime, account_id: int, run: sqlite3.Row | None) -> str:
             state = "⏹ Останавливаю рассылку"
         elif remaining:
             state = f"⏳ Пауза Telegram ещё {remaining} сек"
-        if app.run_id == run["id"] and app.current_group:
+        if run["cycle"] is not None:
+            current = f"\nЦикл <b>{run['cycle']}</b>"
+            if run["completed_at"] and not remaining and not run["stop_requested"]:
+                wait = max(0, int(run["completed_at"] + profile["delay"] - time.time() + 0.999))
+                state = f"⏱ Следующий цикл через {wait} сек"
+        elif app.run_id == run["id"] and app.current_group:
             current = f"\nГруппа <b>{html.escape(app.current_group[:120])}</b>"
         elif not remaining and not run["stop_requested"]:
             current = "\nГотовлю пост и проверяю очередь."
-    uncertain = app.store.target_count(run["id"], "uncertain")
+    uncertain = (
+        run["uncertain_total"] if run["cycle"] is not None
+        else app.store.target_count(run["id"], "uncertain")
+    )
     processed = run["sent"] + run["errors"] + uncertain
-    filled = processed * 10 // run["total"]
+    if run["cycle"] is not None:
+        cycle_total = sum(app.store.target_count(run["id"], state) for state in TARGET_STATES)
+        cycle_done = sum(app.store.target_count(run["id"], state) for state in ("sent", "failed", "uncertain"))
+        filled = cycle_done * 10 // cycle_total if cycle_total else 0
+        processed_text = f"В цикле <b>{cycle_done} из {cycle_total}</b>\nВсего обработано <b>{processed}</b>"
+    else:
+        filled = processed * 10 // run["total"]
+        processed_text = f"Обработано <b>{processed} из {run['total']}</b>"
     progress = "▰" * filled + "▱" * (10 - filled)
     source = f"\nИсходная рассылка #{run['source_run_id']}" if run["source_run_id"] else ""
     text = (
         f"<b>{run_name(run)}</b>{source}\n{state}{current}\n<code>{progress}</code>\n\n"
-        f"Обработано <b>{processed} из {run['total']}</b>\n"
+        f"{processed_text}\n"
         f"Успешно <b>{run['sent']}</b>\nОшибок <b>{run['errors']}</b>"
     )
     if uncertain:
@@ -1077,8 +1219,9 @@ def status_keyboard(app: Runtime, run: sqlite3.Row | None) -> InlineKeyboardMark
             if not run["stop_requested"]:
                 rows.append([button("⏹ Остановить", f"stop:{run_id}", style="danger")])
             rows.append([button("↻ Обновить статус", f"run:{run_id}")])
-        elif app.me and app.store.target_count(run_id, "pending"):
-            rows.append([button("▶ Продолжить с ожидающих", f"resume:{run_id}", style="primary")])
+        elif app.me and (run["cycle"] is not None or app.store.target_count(run_id, "pending")):
+            label = "▶ Продолжить рассылку" if run["cycle"] is not None else "▶ Продолжить с ожидающих"
+            rows.append([button(label, f"resume:{run_id}", style="primary")])
         if run["kind"]:
             rows.append([button("📋 Отчёт по группам", f"results:{run_id}:0")])
     rows.append([button("🗂 История запусков", "history:0")])
@@ -1118,9 +1261,14 @@ async def show_results(app: Runtime, chat_id: int, account_id: int, run_id: int,
     targets = app.store.targets(run_id, page * PAGE_SIZE)
     lines = [f"<b>Отчёт по группам · {run_name(run)}</b>"]
     for target in targets[:PAGE_SIZE]:
-        lines.append(f"\n<b>{html.escape(target['title'][:100])}</b>\n{TARGET_STATES[target['state']]}")
-        if target["detail"]:
-            lines.append(html.escape(target["detail"][:150]))
+        label = TARGET_STATES[target["state"]]
+        detail = target["detail"]
+        if target["state"] == "pending" and target["last_state"] in TARGET_STATES:
+            label += f"\nПоследний цикл — {TARGET_STATES[target['last_state']]}"
+            detail = target["last_detail"]
+        lines.append(f"\n<b>{html.escape(target['title'][:100])}</b>\n{label}")
+        if detail:
+            lines.append(html.escape(detail[:150]))
     if not targets:
         lines.append("Для этого запуска доступны общие счётчики.")
     rows = []
@@ -1250,7 +1398,11 @@ async def show_confirmation(app: Runtime, chat_id: int, account_id: int, state: 
     names = "\n".join(f"• {html.escape(group.title[:100])}" for group in list(groups.values())[:8])
     if len(groups) > 8:
         names += f"\n… и ещё {len(groups) - 8}"
-    text = f"<b>Предпросмотр поста</b>\nПост показан выше.\n\nВыбрано групп <b>{len(groups)}</b>"
+    delay = app.store.profile(account_id)["delay"]
+    text = (
+        f"<b>Предпросмотр поста</b>\nПост показан выше.\n\nВыбрано групп <b>{len(groups)}</b>"
+        f"\nПовтор каждые <b>{delay:g} сек</b> после завершения цикла, до остановки."
+    )
     if names:
         text += "\n" + names
     if note:
@@ -1542,7 +1694,7 @@ async def navigate(callback: CallbackQuery, state: FSMContext, app: Runtime) -> 
     elif action == "pace:send":
         await state.set_state(Flow.delay)
         await show(
-            app, chat_id, f"Пришли задержку от {MIN_DELAY:g} до {MAX_DELAY:g} сек. Например, 4.",
+            app, chat_id, f"Пришли задержку между циклами от {MIN_DELAY:g} до {MAX_DELAY:g} сек. Например, 4.",
             keyboard([button("← К интервалам", "set_delay")], back_menu()),
         )
     elif action == "pace:report":
@@ -1865,6 +2017,18 @@ class RunFailed(Exception):
     """Ошибка подготовки с понятным сообщением для владельца."""
 
 
+class GroupWait(Exception):
+    """Отдельная группа временно ограничена медленным режимом."""
+
+    def __init__(self, seconds: int):
+        self.seconds = seconds
+        super().__init__(seconds)
+
+
+class UploadExpired(Exception):
+    """Ссылка на загруженное фото устарела до отправки."""
+
+
 T = TypeVar("T")
 
 
@@ -1882,28 +2046,56 @@ async def wait_or_stop(stop: asyncio.Event, seconds: float) -> None:
 
 async def mtproto_call(
     app: Runtime, account_id: int, operation: Callable[[], Awaitable[T]], *,
-    target_id: int | None = None,
+    target_id: int | None = None, peer_id: int | None = None, parallel: bool = False,
 ) -> T:
     sending = target_id is not None
+    if sending and peer_id is None:
+        raise ValueError("Для отправки нужна группа.")
     while True:
+        await wait_or_stop(app.stop, 0)
         profile = app.store.profile(account_id)
-        deadline = profile["next_send_at" if sending else "flood_until"]
+        deadline = profile["flood_until"]
+        if sending:
+            group_wait = app.store.group_deadline(account_id, peer_id) - time.time()
+            if parallel and group_wait > MIN_DELAY + 0.5 and deadline <= time.time():
+                raise GroupWait(int(group_wait + 0.999))
+            deadline = max(deadline, app.store.group_deadline(account_id, peer_id))
+            if not parallel:
+                deadline = max(deadline, profile["next_send_at"])
         await wait_or_stop(app.stop, deadline - time.time())
         # За время ожидания другая операция могла продлить паузу.
         profile = app.store.profile(account_id)
-        if profile["next_send_at" if sending else "flood_until"] > time.time():
+        if profile["flood_until"] > time.time():
+            continue
+        if sending and (
+            (not parallel and profile["next_send_at"] > time.time())
+            or app.store.group_deadline(account_id, peer_id) > time.time()
+        ):
             continue
         delay = profile["delay"]
         if sending:
-            app.store.defer(account_id, time.time() + delay)
+            app.store.defer_group(account_id, peer_id, time.time() + MIN_DELAY)
+            if not parallel:
+                app.store.defer(account_id, time.time() + delay)
         try:
             result = await asyncio.wait_for(operation(), timeout=RPC_TIMEOUT)
+        except errors.SlowModeWaitError as exc:
+            if not sending:
+                remember_flood(app, account_id, exc)
+                continue
+            seconds = max(1, int(exc.seconds)) + 1
+            app.store.defer_group(account_id, peer_id, time.time() + seconds, rejected_target=target_id)
+            if parallel:
+                raise GroupWait(seconds) from exc
+            continue
         except FLOOD_ERRORS as exc:
             remember_flood(app, account_id, exc, rejected_target=target_id)
             continue
         finally:
             if sending:
-                app.store.defer(account_id, time.time() + delay)
+                app.store.defer_group(account_id, peer_id, time.time() + MIN_DELAY)
+                if not parallel:
+                    app.store.defer(account_id, time.time() + delay)
         return result
 
 
@@ -2055,6 +2247,10 @@ async def mailer(
     notes = []
     try:
         await wait_or_stop(app.stop, 0)
+        run = app.store.run(run_id, account_id)
+        if run is None:
+            raise RunFailed("Запуск рассылки недоступен.")
+        recurring = run["cycle"] is not None
         content = app.store.snapshot(run_id)
         if content is None:
             raise RunFailed("Снимок поста недоступен.")
@@ -2078,13 +2274,25 @@ async def mailer(
 
         uploaded = None
         uploaded_at = 0.0
+        upload_lock = asyncio.Lock()
 
-        async def send(peer: types.TypeInputPeer, target_id: int) -> object:
+        async def ensure_upload() -> None:
             nonlocal uploaded, uploaded_at
-            # Один загруженный файл на очередь. Долгая пауза обновит ссылку.
-            if photo_data is not None and (uploaded is None or time.monotonic() - uploaded_at >= 3600):
-                uploaded = await app.client.upload_file(photo_data, file_name="acczHELP-photo.jpg")
-                uploaded_at = time.monotonic()
+            if photo_data is None:
+                return
+            async with upload_lock:
+                if uploaded is None or time.monotonic() - uploaded_at >= 3600:
+                    uploaded = await mtproto_call(
+                        app, account_id,
+                        lambda: app.client.upload_file(photo_data, file_name="acczHELP-photo.jpg"),
+                    )
+                    uploaded_at = time.monotonic()
+
+        async def send(peer: types.TypeInputPeer, target_id: int, upload: object) -> object:
+            if photo_data is not None and (
+                upload is None or upload is not uploaded or time.monotonic() - uploaded_at >= 3600
+            ):
+                raise UploadExpired
             await wait_or_stop(app.stop, 0)
             # Состояние фиксируется после загрузки фото, прямо перед публикацией.
             app.store.begin_target(target_id)
@@ -2094,37 +2302,121 @@ async def mailer(
                     formatting_entities=entities, link_preview=False,
                 )
             return await app.client.send_file(
-                peer, types.InputMediaUploadedPhoto(file=uploaded),
+                peer, types.InputMediaUploadedPhoto(file=upload),
                 caption=content.text, parse_mode=None, formatting_entities=entities,
             )
 
-        for target in app.store.pending(run_id):
+        async def send_target(target: sqlite3.Row) -> None:
+            nonlocal uploaded
             await wait_or_stop(app.stop, 0)
             target_id = target["id"]
             saved = target_group(target)
-            app.current_group = saved.title
+            if not recurring:
+                app.current_group = saved.title
             try:
                 group = await resolve_selected(app, account_id, saved)
                 if group is None or group.peer is None:
                     LOG.info("Группа %s недоступна для текущего аккаунта", saved.peer_id)
                     app.store.record(run_id, target_id, "failed", "Группа недоступна для текущего аккаунта.")
-                    continue
+                    return
                 peer = group.peer
-                sent = await mtproto_call(app, account_id, lambda: send(peer, target_id), target_id=target_id)
+                refreshed = False
+                while True:
+                    await ensure_upload()
+                    handle = uploaded
+                    try:
+                        sent = await mtproto_call(
+                            app, account_id, lambda: send(peer, target_id, handle),
+                            target_id=target_id, peer_id=saved.peer_id, parallel=recurring,
+                        )
+                    except UploadExpired:
+                        continue
+                    except (
+                        errors.FilePartMissingError, errors.FilePart0MissingError,
+                        errors.FilePartsInvalidError, errors.FileIdInvalidError,
+                    ):
+                        if photo_data is None or refreshed:
+                            raise
+                        # Ошибка 400 подтверждает отказ. Перезагружаем фото один раз.
+                        app.store.retry_target(target_id)
+                        async with upload_lock:
+                            if uploaded is handle:
+                                uploaded = None
+                        refreshed = True
+                        continue
+                    break
+            except GroupWait as exc:
+                app.store.record(
+                    run_id, target_id, "failed",
+                    f"Ожидание ограничений этой группы ещё {exc.seconds} сек.",
+                )
             except AUTH_ERRORS:
                 if app.store.target_sending(target_id):
                     app.store.record(run_id, target_id, "failed", "Telegram отклонил текущую сессию.")
+                app.stop.set()
                 raise
             except errors.PeerFloodError:
                 app.store.record(run_id, target_id, "failed", "Telegram ограничил исходящие сообщения.")
+                app.stop.set()
                 raise
             except (errors.RPCError, ValueError, OSError, asyncio.TimeoutError) as exc:
                 outcome, detail = delivery_error(exc, app.store.target_sending(target_id))
                 LOG.warning("Отправка в группу %s: %s", saved.peer_id, type(exc).__name__)
                 app.store.record(run_id, target_id, outcome, detail)
+            except RunStopped:
+                raise
+            except Exception:
+                app.stop.set()
+                raise
             else:
                 app.store.record(run_id, target_id, "sent", message_id=getattr(sent, "id", None))
-        state = "done"
+
+        while True:
+            await wait_or_stop(app.stop, 0)
+            targets = app.store.pending(run_id)
+            if recurring:
+                # Все задачи одного цикла создаются до ожидания их результатов.
+                tasks = [asyncio.create_task(send_target(target)) for target in targets]
+                batch = asyncio.gather(*tasks, return_exceptions=True)
+                stop_waiter = asyncio.create_task(app.stop.wait())
+                try:
+                    await asyncio.wait((batch, stop_waiter), return_when=asyncio.FIRST_COMPLETED)
+                    if app.stop.is_set():
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                    results = await batch
+                finally:
+                    stop_waiter.cancel()
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(stop_waiter, *tasks, return_exceptions=True)
+                failures = [result for result in results if isinstance(result, BaseException)]
+                for failure in failures:
+                    if not isinstance(failure, (RunStopped, asyncio.CancelledError)):
+                        raise failure
+                if failures or app.stop.is_set():
+                    raise RunStopped
+            else:
+                for target in targets:
+                    await send_target(target)
+                state = "done"
+                break
+
+            app.store.complete_cycle(run_id)
+            while True:
+                await wait_or_stop(app.stop, 0)
+                run = app.store.run(run_id, account_id)
+                if run is None or not run["completed_at"]:
+                    raise RunFailed("Не удалось сохранить состояние цикла.")
+                delay = app.store.profile(account_id)["delay"]
+                remaining = run["completed_at"] + delay - time.time()
+                if remaining <= 0:
+                    break
+                await wait_or_stop(app.stop, min(remaining, 1.0))
+            if not app.store.advance_cycle(run_id):
+                raise RunStopped
     except RunStopped:
         state = "stopped"
     except asyncio.CancelledError:
